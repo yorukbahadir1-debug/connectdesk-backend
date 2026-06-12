@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+gunicorn
+python-multipart
+firebase-admin
+google-api-python-client
+google-auth
+google-auth-httplib2
+python-dotenv
+google-auth-oauthlib

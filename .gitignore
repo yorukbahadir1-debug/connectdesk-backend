@@ -1,0 +1,10 @@
+firebase_key.json
+drive_service_account.json
+oauth_client.json
+credentials.json
+token.json
+token_drive.json
+*.key
+__pycache__/
+temp_uploads/
+.env
