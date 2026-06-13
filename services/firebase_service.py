@@ -280,3 +280,101 @@ def delete_file_record_by_google_id(google_file_id: str) -> None:
 
     for doc in docs:
         doc.reference.delete()
+
+
+def save_user_drive_token(
+    user_id: str,
+    token_json: Dict[str, Any],
+    drive_email: str = "",
+    drive_display_name: str = ""
+) -> Optional[Dict[str, Any]]:
+    db = init_firebase()
+
+    user_id = str(user_id).strip()
+
+    if not user_id:
+        return None
+
+    ref = db.collection("users").document(user_id)
+    doc = ref.get()
+
+    if not doc.exists:
+        return None
+
+    update_data = {
+        "drive_token_json": token_json,
+        "drive_connected": True,
+        "drive_updated_at": now_iso()
+    }
+
+    if drive_email:
+        update_data["drive_email"] = str(drive_email).strip()
+
+    if drive_display_name:
+        update_data["drive_display_name"] = str(drive_display_name).strip()
+
+    ref.update(update_data)
+
+    updated_doc = ref.get()
+    data = updated_doc.to_dict()
+    data["id"] = updated_doc.id
+
+    return data
+
+
+def get_user_drive_token(user_id: str) -> Optional[Dict[str, Any]]:
+    user = get_user(user_id)
+
+    if not user:
+        return None
+
+    token_json = user.get("drive_token_json")
+
+    if isinstance(token_json, dict):
+        return token_json
+
+    if isinstance(token_json, str) and token_json.strip():
+        try:
+            return json.loads(token_json)
+        except Exception:
+            return None
+
+    return None
+
+
+def get_user_drive_status(user_id: str) -> Dict[str, Any]:
+    user = get_user(user_id)
+
+    if not user:
+        return {
+            "connected": False,
+            "drive_email": "",
+            "drive_display_name": ""
+        }
+
+    token_json = user.get("drive_token_json")
+
+    connected = bool(token_json)
+
+    return {
+        "connected": connected,
+        "drive_email": str(user.get("drive_email", "") or ""),
+        "drive_display_name": str(user.get("drive_display_name", "") or ""),
+        "drive_updated_at": str(user.get("drive_updated_at", "") or "")
+    }
+
+
+def get_file_record_by_google_id(google_file_id: str) -> Optional[Dict[str, Any]]:
+    db = init_firebase()
+
+    google_file_id = str(google_file_id).strip()
+
+    docs = db.collection("contact_files").where("google_file_id", "==", google_file_id).limit(1).stream()
+
+    for doc in docs:
+        data = doc.to_dict()
+        data["id"] = doc.id
+        return data
+
+    return None
+

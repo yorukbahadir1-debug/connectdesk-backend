@@ -1,22 +1,19 @@
 import os
 import json
 import mimetypes
+from typing import Optional, Dict, Any, Tuple
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
-ROOT_FOLDER_NAME = "ConnectDesk_Dosyalar"
-
+ROOT_FOLDER_NAME = os.getenv("DRIVE_ROOT_FOLDER_NAME", "ConnectDesk_Dosyalar")
 OAUTH_CLIENT_FILE = "oauth_client.json"
-TOKEN_FILE = "token_drive.json"
-
-drive_service = None
 
 
 def _load_json_from_env(env_name: str):
@@ -31,69 +28,136 @@ def _load_json_from_env(env_name: str):
         raise RuntimeError(f"{env_name} JSON formati hatali.") from exc
 
 
-def _load_drive_credentials():
-    token_json = _load_json_from_env("TOKEN_DRIVE_JSON")
+def _load_oauth_client_config() -> Dict[str, Any]:
+    config = _load_json_from_env("OAUTH_CLIENT_JSON")
 
-    if token_json:
-        return Credentials.from_authorized_user_info(token_json, SCOPES)
+    if config:
+        return config
 
-    if os.path.exists(TOKEN_FILE):
-        return Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if os.path.exists(OAUTH_CLIENT_FILE):
+        with open(OAUTH_CLIENT_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-    return None
+    raise FileNotFoundError(
+        "Google OAuth bilgisi bulunamadi. Render Environment icin OAUTH_CLIENT_JSON eklenmeli."
+    )
 
 
-def _save_token_if_local(creds):
-    if os.getenv("RENDER", "").strip():
-        return
+def get_public_base_url() -> str:
+    base_url = (
+        os.getenv("PUBLIC_API_BASE_URL", "")
+        or os.getenv("RENDER_EXTERNAL_URL", "")
+        or "http://127.0.0.1:8000"
+    )
+    return base_url.strip().rstrip("/")
+
+
+def get_redirect_uri() -> str:
+    return (
+        os.getenv("OAUTH_REDIRECT_URI", "").strip()
+        or f"{get_public_base_url()}/google/callback"
+    )
+
+
+def _create_flow(state: Optional[str] = None) -> Flow:
+    flow = Flow.from_client_config(
+        _load_oauth_client_config(),
+        scopes=SCOPES,
+        state=state
+    )
+    flow.redirect_uri = get_redirect_uri()
+    return flow
+
+
+def create_google_auth_url(user_id: str) -> str:
+    user_id = str(user_id).strip()
+
+    if not user_id:
+        raise ValueError("Kullanici id bos olamaz.")
+
+    flow = _create_flow(state=user_id)
+
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent"
+    )
+
+    return auth_url
+
+
+def finish_google_callback(authorization_response_url: str, state: str) -> Dict[str, Any]:
+    user_id = str(state or "").strip()
+
+    if not user_id:
+        raise ValueError("Google callback state/user_id bos geldi.")
+
+    flow = _create_flow(state=user_id)
+    flow.fetch_token(authorization_response=authorization_response_url)
+
+    creds = flow.credentials
+    token_info = json.loads(creds.to_json())
+
+    service = build("drive", "v3", credentials=creds)
+
+    drive_email = ""
+    drive_display_name = ""
 
     try:
-        with open(TOKEN_FILE, "w", encoding="utf-8") as token:
-            token.write(creds.to_json())
+        about = service.about().get(fields="user(emailAddress,displayName)").execute()
+        drive_user = about.get("user", {}) or {}
+        drive_email = str(drive_user.get("emailAddress", "") or "")
+        drive_display_name = str(drive_user.get("displayName", "") or "")
     except Exception:
         pass
 
+    from services.firebase_service import save_user_drive_token
 
-def init_drive():
-    global drive_service
+    save_user_drive_token(
+        user_id=user_id,
+        token_json=token_info,
+        drive_email=drive_email,
+        drive_display_name=drive_display_name
+    )
 
-    if drive_service is not None:
-        return drive_service
+    return {
+        "success": True,
+        "user_id": user_id,
+        "drive_email": drive_email,
+        "drive_display_name": drive_display_name
+    }
 
-    creds = _load_drive_credentials()
+
+def build_credentials_from_token(user_id: str) -> Credentials:
+    from services.firebase_service import get_user_drive_token, save_user_drive_token
+
+    token_info = get_user_drive_token(user_id)
+
+    if not token_info:
+        raise RuntimeError(
+            "Google Drive bagli degil. Uygulamada 'Google Drive Bagla' butonuna basin."
+        )
+
+    creds = Credentials.from_authorized_user_info(token_info, SCOPES)
 
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        _save_token_if_local(creds)
-
-    if not creds or not creds.valid:
-        oauth_client_json = _load_json_from_env("OAUTH_CLIENT_JSON")
-
-        if oauth_client_json:
-            flow = InstalledAppFlow.from_client_config(
-                oauth_client_json,
-                SCOPES
-            )
-        else:
-            if not os.path.exists(OAUTH_CLIENT_FILE):
-                raise FileNotFoundError(
-                    "Google Drive token bulunamadi. Render icin TOKEN_DRIVE_JSON environment variable eklenmeli."
-                )
-
-            flow = InstalledAppFlow.from_client_secrets_file(
-                OAUTH_CLIENT_FILE,
-                SCOPES
-            )
-
-        creds = flow.run_local_server(
-            port=0,
-            prompt="consent"
+        save_user_drive_token(
+            user_id=user_id,
+            token_json=json.loads(creds.to_json())
         )
 
-        _save_token_if_local(creds)
+    if not creds or not creds.valid:
+        raise RuntimeError(
+            "Google Drive oturumu gecersiz. Uygulamada Google Drive'i yeniden baglayin."
+        )
 
-    drive_service = build("drive", "v3", credentials=creds)
-    return drive_service
+    return creds
+
+
+def init_drive(user_id: str):
+    creds = build_credentials_from_token(user_id)
+    return build("drive", "v3", credentials=creds)
 
 
 def safe_drive_name(name: str):
@@ -118,8 +182,13 @@ def public_download_url(file_id: str):
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
-def make_file_public(file_id: str):
-    service = init_drive()
+def make_file_public(user_id: str, file_id: str):
+    make_public = str(os.getenv("MAKE_FILES_PUBLIC", "true")).strip().lower()
+
+    if make_public in ("0", "false", "no", "hayir"):
+        return
+
+    service = init_drive(user_id)
 
     try:
         service.permissions().create(
@@ -144,8 +213,8 @@ def enrich_file(file_data: dict):
     return file_data
 
 
-def find_folder_by_name(name: str, parent_id: str = None):
-    service = init_drive()
+def find_folder_by_name(user_id: str, name: str, parent_id: str = None):
+    service = init_drive(user_id)
 
     safe_name = name.replace("'", "\\'")
 
@@ -167,8 +236,8 @@ def find_folder_by_name(name: str, parent_id: str = None):
     return None
 
 
-def create_folder(name: str, parent_id: str = None):
-    service = init_drive()
+def create_folder(user_id: str, name: str, parent_id: str = None):
+    service = init_drive(user_id)
 
     metadata = {
         "name": name,
@@ -186,30 +255,30 @@ def create_folder(name: str, parent_id: str = None):
     return folder["id"]
 
 
-def get_or_create_root_folder():
-    folder_id = find_folder_by_name(ROOT_FOLDER_NAME)
+def get_or_create_root_folder(user_id: str):
+    folder_id = find_folder_by_name(user_id, ROOT_FOLDER_NAME)
 
     if folder_id:
         return folder_id
 
-    return create_folder(ROOT_FOLDER_NAME)
+    return create_folder(user_id, ROOT_FOLDER_NAME)
 
 
-def get_or_create_contact_folder(contact_name: str, contact_id: str):
-    root_folder_id = get_or_create_root_folder()
+def get_or_create_contact_folder(user_id: str, contact_name: str, contact_id: str):
+    root_folder_id = get_or_create_root_folder(user_id)
 
     folder_name = f"{safe_drive_name(contact_name)}_{contact_id}"
 
-    folder_id = find_folder_by_name(folder_name, root_folder_id)
+    folder_id = find_folder_by_name(user_id, folder_name, root_folder_id)
 
     if folder_id:
         return folder_id
 
-    return create_folder(folder_name, root_folder_id)
+    return create_folder(user_id, folder_name, root_folder_id)
 
 
-def list_files_in_folder(folder_id: str):
-    service = init_drive()
+def list_files_in_folder(user_id: str, folder_id: str):
+    service = init_drive(user_id)
 
     query = f"'{folder_id}' in parents and trashed=false"
 
@@ -223,14 +292,14 @@ def list_files_in_folder(folder_id: str):
 
     for item in files:
         if item.get("id"):
-            make_file_public(item["id"])
+            make_file_public(user_id, item["id"])
             enrich_file(item)
 
     return files
 
 
-def upload_file_to_folder(file_path: str, folder_id: str):
-    service = init_drive()
+def upload_file_to_folder(user_id: str, file_path: str, folder_id: str):
+    service = init_drive(user_id)
 
     file_name = os.path.basename(file_path)
 
@@ -256,7 +325,7 @@ def upload_file_to_folder(file_path: str, folder_id: str):
         fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink"
     ).execute()
 
-    make_file_public(uploaded_file["id"])
+    make_file_public(user_id, uploaded_file["id"])
 
     uploaded_file = service.files().get(
         fileId=uploaded_file["id"],
@@ -266,16 +335,16 @@ def upload_file_to_folder(file_path: str, folder_id: str):
     return enrich_file(uploaded_file)
 
 
-def delete_drive_file(file_id: str):
-    service = init_drive()
+def delete_drive_file(user_id: str, file_id: str):
+    service = init_drive(user_id)
 
     service.files().delete(
         fileId=file_id
     ).execute()
 
 
-def replace_file_content(file_id: str, file_path: str):
-    service = init_drive()
+def replace_file_content(user_id: str, file_id: str, file_path: str):
+    service = init_drive(user_id)
 
     mime_type, _ = mimetypes.guess_type(file_path)
 
@@ -294,7 +363,7 @@ def replace_file_content(file_id: str, file_path: str):
         fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink"
     ).execute()
 
-    make_file_public(file_id)
+    make_file_public(user_id, file_id)
 
     updated_file = service.files().get(
         fileId=file_id,
