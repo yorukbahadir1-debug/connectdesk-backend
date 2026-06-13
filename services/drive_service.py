@@ -63,7 +63,8 @@ def _create_flow(state: Optional[str] = None) -> Flow:
     flow = Flow.from_client_config(
         _load_oauth_client_config(),
         scopes=SCOPES,
-        state=state
+        state=state,
+        autogenerate_code_verifier=False
     )
     flow.redirect_uri = get_redirect_uri()
     return flow
@@ -371,3 +372,4 @@ def replace_file_content(user_id: str, file_id: str, file_path: str):
     ).execute()
 
     return enrich_file(updated_file)
+
