@@ -1,4 +1,5 @@
 import os
+import json
 import mimetypes
 
 from googleapiclient.discovery import build
@@ -18,38 +19,78 @@ TOKEN_FILE = "token_drive.json"
 drive_service = None
 
 
+def _load_json_from_env(env_name: str):
+    value = os.getenv(env_name, "").strip()
+
+    if not value:
+        return None
+
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{env_name} JSON formati hatali.") from exc
+
+
+def _load_drive_credentials():
+    token_json = _load_json_from_env("TOKEN_DRIVE_JSON")
+
+    if token_json:
+        return Credentials.from_authorized_user_info(token_json, SCOPES)
+
+    if os.path.exists(TOKEN_FILE):
+        return Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+
+    return None
+
+
+def _save_token_if_local(creds):
+    if os.getenv("RENDER", "").strip():
+        return
+
+    try:
+        with open(TOKEN_FILE, "w", encoding="utf-8") as token:
+            token.write(creds.to_json())
+    except Exception:
+        pass
+
+
 def init_drive():
     global drive_service
 
     if drive_service is not None:
         return drive_service
 
-    creds = None
-
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    creds = _load_drive_credentials()
 
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
+        _save_token_if_local(creds)
 
     if not creds or not creds.valid:
-        if not os.path.exists(OAUTH_CLIENT_FILE):
-            raise FileNotFoundError(
-                "oauth_client.json bulunamadi. Backend klasorune koy."
-            )
+        oauth_client_json = _load_json_from_env("OAUTH_CLIENT_JSON")
 
-        flow = InstalledAppFlow.from_client_secrets_file(
-            OAUTH_CLIENT_FILE,
-            SCOPES
-        )
+        if oauth_client_json:
+            flow = InstalledAppFlow.from_client_config(
+                oauth_client_json,
+                SCOPES
+            )
+        else:
+            if not os.path.exists(OAUTH_CLIENT_FILE):
+                raise FileNotFoundError(
+                    "Google Drive token bulunamadi. Render icin TOKEN_DRIVE_JSON environment variable eklenmeli."
+                )
+
+            flow = InstalledAppFlow.from_client_secrets_file(
+                OAUTH_CLIENT_FILE,
+                SCOPES
+            )
 
         creds = flow.run_local_server(
             port=0,
             prompt="consent"
         )
 
-        with open(TOKEN_FILE, "w", encoding="utf-8") as token:
-            token.write(creds.to_json())
+        _save_token_if_local(creds)
 
     drive_service = build("drive", "v3", credentials=creds)
     return drive_service
