@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 import json
 import mimetypes
 from typing import Optional, Dict, Any, Tuple
@@ -256,6 +257,22 @@ def create_folder(user_id: str, name: str, parent_id: str = None):
     return folder["id"]
 
 
+def rename_drive_file(user_id: str, file_id: str, new_name: str):
+    file_id = str(file_id or "").strip()
+    new_name = safe_drive_name(new_name)
+
+    if not file_id:
+        return None
+
+    service = init_drive(user_id)
+
+    return service.files().update(
+        fileId=file_id,
+        body={"name": new_name},
+        fields="id, name, mimeType, webViewLink, webContentLink"
+    ).execute()
+
+
 def get_or_create_root_folder(user_id: str):
     folder_id = find_folder_by_name(user_id, ROOT_FOLDER_NAME)
 
@@ -373,3 +390,114 @@ def replace_file_content(user_id: str, file_id: str, file_path: str):
 
     return enrich_file(updated_file)
 
+
+
+# ============================================================
+# CONNECTDESK BACKUP DRIVE HELPERS
+# ============================================================
+
+def get_or_create_contact_backup_folder(user_id: str, contact_name: str, contact_id: str):
+    contact_folder_id = get_or_create_contact_folder(user_id, contact_name, contact_id)
+
+    backup_folder_name = "__BACKUP__"
+
+    folder_id = find_folder_by_name(user_id, backup_folder_name, contact_folder_id)
+
+    if folder_id:
+        return folder_id
+
+    return create_folder(user_id, backup_folder_name, contact_folder_id)
+
+
+def upload_file_to_folder_as(user_id: str, file_path: str, folder_id: str, drive_file_name: str):
+    service = init_drive(user_id)
+
+    mime_type, _ = mimetypes.guess_type(file_path)
+
+    if mime_type is None:
+        mime_type = "application/octet-stream"
+
+    metadata = {
+        "name": str(drive_file_name or os.path.basename(file_path)).strip(),
+        "parents": [folder_id]
+    }
+
+    media = MediaFileUpload(
+        file_path,
+        mimetype=mime_type,
+        resumable=False
+    )
+
+    uploaded_file = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink"
+    ).execute()
+
+    make_file_public(user_id, uploaded_file["id"])
+
+    uploaded_file = service.files().get(
+        fileId=uploaded_file["id"],
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink"
+    ).execute()
+
+    return enrich_file(uploaded_file)
+
+
+def upload_file_with_backup(user_id: str, file_path: str, original_folder_id: str, backup_folder_id: str, original_filename: str = ""):
+    original_name = str(original_filename or os.path.basename(file_path)).strip() or os.path.basename(file_path)
+
+    original_file = upload_file_to_folder_as(
+        user_id=user_id,
+        file_path=file_path,
+        folder_id=original_folder_id,
+        drive_file_name=original_name
+    )
+
+    backup_file = upload_file_to_folder_as(
+        user_id=user_id,
+        file_path=file_path,
+        folder_id=backup_folder_id,
+        drive_file_name=f"BACKUP_{original_name}"
+    )
+
+    return {
+        "original": original_file,
+        "backup": backup_file
+    }
+
+
+def upload_text_backup_file(user_id: str, folder_id: str, file_name: str, text_content: str):
+    import tempfile
+
+    safe_name = str(file_name or "recovery_backup.json").strip()
+
+    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".json") as f:
+        f.write(str(text_content or ""))
+        temp_path = f.name
+
+    try:
+        return upload_file_to_folder_as(
+            user_id=user_id,
+            file_path=temp_path,
+            folder_id=folder_id,
+            drive_file_name=safe_name
+        )
+    finally:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
+
+def get_or_create_user_recovery_folder(user_id: str):
+    root_folder_id = get_or_create_root_folder(user_id)
+
+    folder_name = "__RECOVERY__"
+
+    folder_id = find_folder_by_name(user_id, folder_name, root_folder_id)
+
+    if folder_id:
+        return folder_id
+
+    return create_folder(user_id, folder_name, root_folder_id)
