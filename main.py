@@ -172,16 +172,6 @@ def health():
     }
 
 
-@app.get("/api/test")
-def api_test():
-    return {
-        "success": True,
-        "message": "API baglantisi basarili",
-        "backend": "connectdesk-backend",
-        "version": "2.0.0"
-    }
-
-
 @app.post("/register")
 def register(
     email: str = Form(...),
@@ -583,18 +573,16 @@ async def upload_contact_file(
 
     backup_password = str(backup_password or "").strip()
 
-    if backup_enabled:
-        if not backup_password:
-            raise HTTPException(
-                status_code=400,
-                detail="Yedekleme acik. Dosya yuklemek icin yedekleme sifresi gerekli."
-            )
+    backup_allowed_for_this_upload = False
 
+    if backup_enabled and backup_password:
         if not verify_backup_password(backup_password, backup_settings.get("backup_password_hash", "")):
             raise HTTPException(
                 status_code=400,
                 detail="Yedekleme sifresi hatali."
             )
+
+        backup_allowed_for_this_upload = True
 
     try:
         with open(temp_path, "wb") as buffer:
@@ -617,22 +605,28 @@ async def upload_contact_file(
 
         recovery_backup_file = None
 
-        if backup_enabled:
-            recovery_backup_file = backup_uploaded_file_for_contact(
-                user=user,
-                contact=contact,
-                local_file_path=temp_path,
-                original_filename=original_filename,
-                backup_password=backup_password
-            )
+        recovery_backup_error = ""
 
-            save_file_record_recovery_backup(
-                file_record_id=file_record["id"],
-                recovery_backup_file_id=recovery_backup_file.get("id", ""),
-                recovery_backup_file_name=recovery_backup_file.get("name", ""),
-                recovery_backup_web_view_link=recovery_backup_file.get("webViewLink", ""),
-                recovery_backup_web_content_link=recovery_backup_file.get("webContentLink", "")
-            )
+        if backup_allowed_for_this_upload:
+            try:
+                recovery_backup_file = backup_uploaded_file_for_contact(
+                    user=user,
+                    contact=contact,
+                    local_file_path=temp_path,
+                    original_filename=original_filename,
+                    backup_password=backup_password
+                )
+
+                save_file_record_recovery_backup(
+                    file_record_id=file_record["id"],
+                    recovery_backup_file_id=recovery_backup_file.get("id", ""),
+                    recovery_backup_file_name=recovery_backup_file.get("name", ""),
+                    recovery_backup_web_view_link=recovery_backup_file.get("webViewLink", ""),
+                    recovery_backup_web_content_link=recovery_backup_file.get("webContentLink", "")
+                )
+            except Exception as exc:
+                recovery_backup_error = str(exc)
+                recovery_backup_file = None
 
         return {
             "success": True,
@@ -641,7 +635,9 @@ async def upload_contact_file(
             "file": uploaded_file,
             "file_record": file_record,
             "recovery_backup_enabled": backup_enabled,
-            "recovery_backup_file": recovery_backup_file
+            "recovery_backup_requested": backup_allowed_for_this_upload,
+            "recovery_backup_file": recovery_backup_file,
+            "recovery_backup_error": recovery_backup_error
         }
 
     finally:
