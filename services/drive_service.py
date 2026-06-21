@@ -2,10 +2,11 @@ import os
 os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 import json
 import mimetypes
+import io
 from typing import Optional, Dict, Any, Tuple
 
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
@@ -390,6 +391,38 @@ def replace_file_content(user_id: str, file_id: str, file_path: str):
 
     return enrich_file(updated_file)
 
+
+
+def download_drive_file_bytes(user_id: str, file_id: str):
+    file_id = str(file_id or "").strip()
+
+    if not file_id:
+        raise ValueError("Dosya id bos olamaz.")
+
+    service = init_drive(user_id)
+
+    metadata = service.files().get(
+        fileId=file_id,
+        fields="id, name, mimeType"
+    ).execute()
+
+    request = service.files().get_media(fileId=file_id)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+
+    done = False
+
+    while not done:
+        _, done = downloader.next_chunk()
+
+    buffer.seek(0)
+
+    return {
+        "id": metadata.get("id", file_id),
+        "name": metadata.get("name", ""),
+        "mimeType": metadata.get("mimeType", "application/octet-stream"),
+        "content": buffer.getvalue()
+    }
 
 
 # ============================================================
