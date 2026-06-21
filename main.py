@@ -6,10 +6,11 @@ import shutil
 import uuid
 import json
 import time
+import io
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from services.crypto_service import hash_backup_password, verify_backup_password
 from services.backup_service import upload_encrypted_recovery_backup, backup_uploaded_file_for_contact, decrypt_recovery_backup_text, rotate_backup_password_for_all_files
@@ -58,7 +59,8 @@ from services.drive_service import (
     delete_drive_file,
     replace_file_content,
     rename_drive_file,
-    safe_drive_name
+    safe_drive_name,
+    download_drive_file_bytes
 )
 
 
@@ -152,6 +154,62 @@ def get_or_create_backup_folder_for_contact(contact: dict):
         contact_name=contact.get("name", "Kisi"),
         contact_id=contact["id"]
     )
+
+
+def find_contact_profile_file(contact: dict, files: list):
+    profile_file_id = str(contact.get("profile_image_file_id", "") or "").strip()
+    profile_file_name = str(contact.get("profile_image_name", "") or "").strip()
+
+    if profile_file_id:
+        for item in files:
+            if str(item.get("id", "")).strip() == profile_file_id:
+                return item
+
+        return {
+            "id": profile_file_id,
+            "name": profile_file_name or "profile_image",
+            "mimeType": contact.get("profile_image_mime_type", "")
+        }
+
+    if profile_file_name:
+        for item in files:
+            if str(item.get("name", "")).strip() == profile_file_name:
+                return item
+
+    image_candidates = []
+
+    for item in files:
+        name = str(item.get("name", "") or "").lower()
+        mime_type = str(item.get("mimeType", "") or "").lower()
+
+        if not mime_type.startswith("image/"):
+            continue
+
+        score = 0
+
+        if name.startswith("__profile__") or "__profile__" in name:
+            score += 100
+
+        if "profile" in name or "profil" in name:
+            score += 90
+
+        if "whatsapp" in name:
+            score += 30
+
+        if "jpg" in name or "jpeg" in name or "jpeg" in mime_type or "jpg" in mime_type:
+            score += 15
+
+        if "ekran" in name or "screenshot" in name:
+            score -= 45
+
+        image_candidates.append((score, item))
+
+    if not image_candidates:
+        return None
+
+    image_candidates.sort(key=lambda pair: pair[0], reverse=True)
+
+    return image_candidates[0][1]
 
 
 @app.get("/")
@@ -501,6 +559,69 @@ async def upload_contact_profile_image(
                 os.remove(temp_path)
         except PermissionError:
             pass
+
+
+@app.get("/contacts/{contact_id}/profile-image/view")
+def view_contact_profile_image(contact_id: str):
+    contact = require_contact(contact_id)
+
+    folder_id = get_or_create_folder_for_contact(contact)
+
+    try:
+        files = list_files_in_folder(
+            user_id=contact["user_id"],
+            folder_id=folder_id
+        )
+
+        profile_file = find_contact_profile_file(contact, files)
+
+        if not profile_file:
+            raise HTTPException(
+                status_code=404,
+                detail="Profil resmi bulunamadi."
+            )
+
+        file_id = str(profile_file.get("id", "")).strip()
+
+        if not file_id:
+            raise HTTPException(
+                status_code=404,
+                detail="Profil resmi dosya id bulunamadi."
+            )
+
+        downloaded = download_drive_file_bytes(
+            user_id=contact["user_id"],
+            file_id=file_id
+        )
+
+        mime_type = str(downloaded.get("mimeType", "") or profile_file.get("mimeType", "") or "application/octet-stream")
+
+        if not mime_type.startswith("image/"):
+            raise HTTPException(
+                status_code=400,
+                detail="Profil dosyasi resim formatinda degil."
+            )
+
+        file_name = str(downloaded.get("name", "") or profile_file.get("name", "") or "profile_image")
+
+        headers = {
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Content-Disposition": f'inline; filename="{file_name}"'
+        }
+
+        return StreamingResponse(
+            io.BytesIO(downloaded.get("content", b"")),
+            media_type=mime_type,
+            headers=headers
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Profil resmi okunamadi: {str(exc)}"
+        )
 
 
 @app.delete("/contacts/{contact_id}")
