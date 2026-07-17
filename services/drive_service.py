@@ -303,7 +303,7 @@ def list_files_in_folder(user_id: str, folder_id: str):
 
     result = service.files().list(
         q=query,
-        fields="files(id, name, mimeType, size, webViewLink, webContentLink, thumbnailLink, modifiedTime)",
+        fields="files(id, name, mimeType, size, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime)",
         orderBy="modifiedTime desc"
     ).execute()
 
@@ -311,7 +311,8 @@ def list_files_in_folder(user_id: str, folder_id: str):
 
     for item in files:
         if item.get("id"):
-            make_file_public(user_id, item["id"])
+            # Hız için listeleme sırasında her dosyaya tekrar public izin basmıyoruz.
+            # Yükleme sırasında public izin zaten veriliyor; burada sadece linkleri zenginleştiriyoruz.
             enrich_file(item)
 
     return files
@@ -341,14 +342,14 @@ def upload_file_to_folder(user_id: str, file_path: str, folder_id: str):
     uploaded_file = service.files().create(
         body=metadata,
         media_body=media,
-        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink"
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime, size"
     ).execute()
 
     make_file_public(user_id, uploaded_file["id"])
 
     uploaded_file = service.files().get(
         fileId=uploaded_file["id"],
-        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink"
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime, size"
     ).execute()
 
     return enrich_file(uploaded_file)
@@ -379,14 +380,14 @@ def replace_file_content(user_id: str, file_id: str, file_path: str):
     updated_file = service.files().update(
         fileId=file_id,
         media_body=media,
-        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink"
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime, size"
     ).execute()
 
     make_file_public(user_id, file_id)
 
     updated_file = service.files().get(
         fileId=file_id,
-        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink"
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime, size"
     ).execute()
 
     return enrich_file(updated_file)
@@ -464,14 +465,14 @@ def upload_file_to_folder_as(user_id: str, file_path: str, folder_id: str, drive
     uploaded_file = service.files().create(
         body=metadata,
         media_body=media,
-        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink"
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime, size"
     ).execute()
 
     make_file_public(user_id, uploaded_file["id"])
 
     uploaded_file = service.files().get(
         fileId=uploaded_file["id"],
-        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink"
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime, size"
     ).execute()
 
     return enrich_file(uploaded_file)
