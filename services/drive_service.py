@@ -1,605 +1,537 @@
 import os
-import time
-import tempfile
-import uuid
-import shutil
-from pathlib import Path
-from typing import Optional
+os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+import json
+import mimetypes
+import io
+from typing import Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, HTTPException, Form, UploadFile, File, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from pydantic import BaseModel, EmailStr, Field
-
-from services.firebase_service import (
-    create_user, login_user, get_user, create_contact, update_contact_details,
-    update_contact_note, update_contact_profile_image, list_contacts, get_contact,
-    delete_contact as fb_delete_contact, list_contact_files, save_file_record,
-    delete_file_record_by_google_id, get_user_drive_status, save_password_reset_code,
-    verify_password_reset_code, mark_password_reset_code_used, update_user_password_by_email,
-    get_user_backup_settings, set_backup_enabled, save_recovery_backup_record,
-    list_user_file_records
-)
-from services.drive_service import (
-    create_google_auth_url, finish_google_callback, get_or_create_contact_folder,
-    upload_file_to_folder, replace_file_content, delete_drive_file, list_files_in_folder, download_drive_file_bytes
-)
-from services.mail_service import generate_reset_code, send_password_reset_code
-from services.crypto_service import hash_backup_password, verify_backup_password
-from services.backup_service import upload_encrypted_recovery_backup, decrypt_recovery_backup_text
-from services.backup_drive_service import get_latest_recovery_file, download_recovery_file_text
-
-app = FastAPI(title="ConnectDesk Backend", version="2.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    # Frontend statik hosting/cPanel üzerinde çalışacak.
-    # İsteklerde cookie/session kullanılmadığı için CORS wildcard güvenli ve pratiktir.
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-RESET_TTL_SECONDS = int(os.getenv("RESET_TTL_SECONDS", "900"))
-TEMP_DIR = Path(os.getenv("TEMP_UPLOAD_DIR", "temp_uploads"))
-TEMP_DIR.mkdir(exist_ok=True)
-
-class AuthJSON(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=4)
-
-class ForgotJSON(BaseModel):
-    email: EmailStr
-
-class VerifyCodeJSON(BaseModel):
-    email: EmailStr
-    code: str
-
-class ResetJSON(BaseModel):
-    email: EmailStr
-    code: str
-    new_password: str = Field(min_length=4)
-
-class ContactJSON(BaseModel):
-    user_id: str
-    name: str
-    phone: str = ""
-    note: str = ""
-    email: str = ""
-    company: str = ""
-    drive: str = ""
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from google.auth.transport.requests import Request
 
 
-def _email(value: str) -> str:
-    return str(value or "").strip().lower()
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+ROOT_FOLDER_NAME = os.getenv("DRIVE_ROOT_FOLDER_NAME", "ConnectDesk_Dosyalar")
+OAUTH_CLIENT_FILE = "oauth_client.json"
 
 
-def _safe_upload_filename(name: str) -> str:
-    name = str(name or "upload.bin").strip()
-    name = os.path.basename(name)
-    for ch in ['<', '>', ':', '"', '/', '\\', '|', '?', '*']:
-        name = name.replace(ch, "_")
-    return name or "upload.bin"
+def _load_json_from_env(env_name: str):
+    value = os.getenv(env_name, "").strip()
 
+    if not value:
+        return None
 
-def _save_upload(upload: UploadFile) -> str:
-    filename = _safe_upload_filename(upload.filename or "upload.bin")
-    folder = TEMP_DIR / str(uuid.uuid4())
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / filename
-    with open(path, "wb") as f:
-        shutil.copyfileobj(upload.file, f)
-    return str(path)
-
-
-def _cleanup_upload_path(path: str):
     try:
-        p = Path(path)
-        if p.exists():
-            p.unlink()
-        try:
-            p.parent.rmdir()
-        except Exception:
-            pass
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{env_name} JSON formati hatali.") from exc
+
+
+def _load_oauth_client_config() -> Dict[str, Any]:
+    config = _load_json_from_env("OAUTH_CLIENT_JSON")
+
+    if config:
+        return config
+
+    if os.path.exists(OAUTH_CLIENT_FILE):
+        with open(OAUTH_CLIENT_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    raise FileNotFoundError(
+        "Google OAuth bilgisi bulunamadi. Render Environment icin OAUTH_CLIENT_JSON eklenmeli."
+    )
+
+
+def get_public_base_url() -> str:
+    base_url = (
+        os.getenv("PUBLIC_API_BASE_URL", "")
+        or os.getenv("RENDER_EXTERNAL_URL", "")
+        or "http://127.0.0.1:8000"
+    )
+    return base_url.strip().rstrip("/")
+
+
+def get_redirect_uri() -> str:
+    return (
+        os.getenv("OAUTH_REDIRECT_URI", "").strip()
+        or f"{get_public_base_url()}/google/callback"
+    )
+
+
+def _create_flow(state: Optional[str] = None) -> Flow:
+    flow = Flow.from_client_config(
+        _load_oauth_client_config(),
+        scopes=SCOPES,
+        state=state,
+        autogenerate_code_verifier=False
+    )
+    flow.redirect_uri = get_redirect_uri()
+    return flow
+
+
+def create_google_auth_url(user_id: str) -> str:
+    user_id = str(user_id).strip()
+
+    if not user_id:
+        raise ValueError("Kullanici id bos olamaz.")
+
+    flow = _create_flow(state=user_id)
+
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent"
+    )
+
+    return auth_url
+
+
+def finish_google_callback(authorization_response_url: str, state: str) -> Dict[str, Any]:
+    user_id = str(state or "").strip()
+
+    if not user_id:
+        raise ValueError("Google callback state/user_id bos geldi.")
+
+    flow = _create_flow(state=user_id)
+    flow.fetch_token(authorization_response=authorization_response_url)
+
+    creds = flow.credentials
+    token_info = json.loads(creds.to_json())
+
+    service = build("drive", "v3", credentials=creds)
+
+    drive_email = ""
+    drive_display_name = ""
+
+    try:
+        about = service.about().get(fields="user(emailAddress,displayName)").execute()
+        drive_user = about.get("user", {}) or {}
+        drive_email = str(drive_user.get("emailAddress", "") or "")
+        drive_display_name = str(drive_user.get("displayName", "") or "")
     except Exception:
         pass
 
+    from services.firebase_service import save_user_drive_token
 
-def _clean_display_file_name(name: str) -> str:
-    name = str(name or "Dosya").strip() or "Dosya"
+    save_user_drive_token(
+        user_id=user_id,
+        token_json=token_info,
+        drive_email=drive_email,
+        drive_display_name=drive_display_name
+    )
 
-    if "_" in name:
-        prefix, rest = name.split("_", 1)
-        uuid_like = (
-            len(prefix) >= 30
-            and prefix.count("-") >= 4
-            and all(ch.isalnum() or ch == "-" for ch in prefix)
+    return {
+        "success": True,
+        "user_id": user_id,
+        "drive_email": drive_email,
+        "drive_display_name": drive_display_name
+    }
+
+
+def build_credentials_from_token(user_id: str) -> Credentials:
+    from services.firebase_service import get_user_drive_token, save_user_drive_token
+
+    token_info = get_user_drive_token(user_id)
+
+    if not token_info:
+        raise RuntimeError(
+            "Google Drive bagli degil. Uygulamada 'Google Drive Bagla' butonuna basin."
         )
-        if uuid_like and rest.strip():
-            name = rest.strip()
 
-    lowered = name.lower()
-    if lowered.startswith("connectdesk_"):
-        name = name[len("connectdesk_"):].lstrip("_- ").strip() or name
-    if lowered.startswith("backup_"):
-        name = name[len("backup_"):].lstrip("_- ").strip() or name
+    creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        save_user_drive_token(
+            user_id=user_id,
+            token_json=json.loads(creds.to_json())
+        )
+
+    if not creds or not creds.valid:
+        raise RuntimeError(
+            "Google Drive oturumu gecersiz. Uygulamada Google Drive'i yeniden baglayin."
+        )
+
+    return creds
+
+
+def init_drive(user_id: str):
+    creds = build_credentials_from_token(user_id)
+    return build("drive", "v3", credentials=creds)
+
+
+def safe_drive_name(name: str):
+    name = str(name).strip()
+
+    invalid_chars = ["/", "\\", ":", "*", "?", '"', "<", ">", "|"]
+
+    for char in invalid_chars:
+        name = name.replace(char, "-")
+
+    if not name:
+        name = "Adsiz"
 
     return name
 
 
-def _public_contact(data: dict) -> dict:
-    return data or {}
+def public_view_url(file_id: str):
+    return f"https://drive.google.com/uc?export=view&id={file_id}"
 
 
-def _file_id(value: dict) -> str:
-    return str(
-        (value or {}).get("id")
-        or (value or {}).get("google_file_id")
-        or (value or {}).get("file_id")
-        or ""
-    ).strip()
+def public_download_url(file_id: str):
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
-def _is_image_mime(mime_type: str, name: str = "") -> bool:
-    mime = str(mime_type or "").lower()
-    filename = str(name or "").lower()
-    return (
-        mime.startswith("image/")
-        or filename.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"))
-    )
+def make_file_public(user_id: str, file_id: str):
+    make_public = str(os.getenv("MAKE_FILES_PUBLIC", "true")).strip().lower()
+
+    if make_public in ("0", "false", "no", "hayir"):
+        return
+
+    service = init_drive(user_id)
+
+    try:
+        service.permissions().create(
+            fileId=file_id,
+            body={
+                "type": "anyone",
+                "role": "reader"
+            },
+            fields="id"
+        ).execute()
+    except Exception:
+        pass
 
 
-def _file_payload(file_item: dict, contact_id: str = "", user_id: str = "") -> dict:
-    item = dict(file_item or {})
-    fid = _file_id(item)
-    name = _clean_display_file_name(item.get("display_name") or item.get("original_name") or item.get("name") or item.get("file_name") or item.get("filename") or "Dosya")
-    mime_type = str(item.get("mimeType") or item.get("mime_type") or "")
-    web_view = str(item.get("webViewLink") or item.get("web_view_link") or item.get("view_url") or "")
-    web_content = str(item.get("webContentLink") or item.get("web_content_link") or item.get("download_url") or "")
-    thumbnail = str(item.get("thumbnailLink") or item.get("thumbnail_link") or item.get("thumbnail_url") or "")
+def enrich_file(file_data: dict):
+    file_id = file_data.get("id", "")
 
-    if fid:
-        web_view = web_view or f"https://drive.google.com/file/d/{fid}/view"
-        web_content = web_content or f"https://drive.google.com/uc?export=download&id={fid}"
-        if not thumbnail and _is_image_mime(mime_type, name):
-            thumbnail = f"https://drive.google.com/thumbnail?id={fid}&sz=w320"
+    if file_id:
+        file_data["view_url"] = public_view_url(file_id)
+        file_data["download_url"] = public_download_url(file_id)
 
-    preview_url = f"/files/{fid}/view" if fid else ""
+    return file_data
 
-    return {
-        **item,
-        "id": fid,
-        "google_file_id": fid,
-        "contact_id": contact_id or item.get("contact_id", ""),
-        "user_id": user_id or item.get("user_id", ""),
-        "name": _clean_display_file_name(name),
-        "display_name": name,
-        "mimeType": mime_type,
-        "mime_type": mime_type,
-        "size": item.get("size") or item.get("file_size") or "",
-        "createdTime": item.get("createdTime") or item.get("created_time") or item.get("created_at") or "",
-        "modifiedTime": item.get("modifiedTime") or item.get("modified_time") or item.get("updated_at") or "",
-        "webViewLink": web_view,
-        "webContentLink": web_content,
-        "view_url": web_view,
-        "download_url": web_content,
-        "thumbnailLink": thumbnail,
-        "thumbnail_url": thumbnail,
-        "preview_url": preview_url,
-        "backend_view_url": preview_url,
-        "is_image": _is_image_mime(mime_type, name),
-        "is_google_native": mime_type.startswith("application/vnd.google-apps."),
+
+def find_folder_by_name(user_id: str, name: str, parent_id: str = None):
+    service = init_drive(user_id)
+
+    safe_name = name.replace("'", "\\'")
+
+    query = f"name='{safe_name}' and mimeType='{FOLDER_MIME_TYPE}' and trashed=false"
+
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+
+    result = service.files().list(
+        q=query,
+        fields="files(id, name)"
+    ).execute()
+
+    files = result.get("files", [])
+
+    if files:
+        return files[0]["id"]
+
+    return None
+
+
+def create_folder(user_id: str, name: str, parent_id: str = None):
+    service = init_drive(user_id)
+
+    metadata = {
+        "name": name,
+        "mimeType": FOLDER_MIME_TYPE
     }
 
-@app.get("/")
-def root():
-    return {"ok": True, "service": "ConnectDesk Backend", "version": "2.0.0"}
+    if parent_id:
+        metadata["parents"] = [parent_id]
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+    folder = service.files().create(
+        body=metadata,
+        fields="id, name"
+    ).execute()
 
-@app.post("/register")
-def register_form(email: str = Form(...), password: str = Form(...)):
-    user = create_user(_email(email), password)
-    if not user:
-        raise HTTPException(status_code=409, detail="Bu e-posta zaten kayıtlı.")
-    return {"ok": True, "message": "Hesap oluşturuldu.", "user": user, **user}
-
-@app.post("/auth/register")
-def register_json(payload: AuthJSON):
-    return register_form(str(payload.email), payload.password)
-
-@app.post("/login")
-def login_form(email: str = Form(...), password: str = Form(...)):
-    user = login_user(_email(email), password)
-    if not user:
-        raise HTTPException(status_code=401, detail="E-posta veya şifre hatalı.")
-    return {"ok": True, "message": "Giriş başarılı.", "user": user, **user}
-
-@app.post("/auth/login")
-def login_json(payload: AuthJSON):
-    return login_form(str(payload.email), payload.password)
-
-@app.get("/users/{user_id}/contacts")
-def contacts(user_id: str):
-    return {"ok": True, "contacts": [_public_contact(c) for c in list_contacts(user_id)]}
-
-@app.post("/contacts")
-def add_contact(
-    user_id: str = Form(...), name: str = Form(...), phone: str = Form(""), note: str = Form(""),
-    email: str = Form(""), company: str = Form(""), drive: str = Form("")
-):
-    if not name.strip():
-        raise HTTPException(status_code=400, detail="Ad soyad boş olamaz.")
-    contact = create_contact(user_id=user_id, name=name, phone=phone, note=note, email=email, company=company, drive=drive)
-    return {"ok": True, "contact": contact, **contact}
-
-@app.post("/contacts/json")
-def add_contact_json(payload: ContactJSON):
-    return add_contact(payload.user_id, payload.name, payload.phone, payload.note, payload.email, payload.company, payload.drive)
-
-@app.put("/contacts/{contact_id}")
-def update_contact(
-    contact_id: str, name: str = Form(...), phone: str = Form(""), email: str = Form(""),
-    company: str = Form(""), drive: str = Form("")
-):
-    contact = update_contact_details(contact_id, name, phone, email, company, drive)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Kişi bulunamadı.")
-    return {"ok": True, "contact": contact, **contact}
-
-@app.put("/contacts/{contact_id}/note")
-def update_note(contact_id: str, note: str = Form(...)):
-    contact = update_contact_note(contact_id, note)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Kişi bulunamadı.")
-    return {"ok": True, "contact": contact, **contact}
-
-@app.delete("/contacts/{contact_id}")
-def delete_contact(contact_id: str):
-    fb_delete_contact(contact_id)
-    return {"ok": True}
-
-@app.post("/contacts/{contact_id}/profile-image")
-def upload_profile_image(contact_id: str, file: UploadFile = File(...)):
-    contact = get_contact(contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Kişi bulunamadı.")
-    user_id = contact.get("user_id")
-    path = _save_upload(file)
-    try:
-        folder_id = contact.get("google_folder_id") or get_or_create_contact_folder(user_id, contact.get("name", "Kişi"), contact_id)
-        uploaded = upload_file_to_folder(user_id, path, folder_id)
-        updated = update_contact_profile_image(contact_id, uploaded)
-        return {"ok": True, "contact": updated, "file": uploaded}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Profil resmi yüklenemedi: {exc}")
-    finally:
-        try: _cleanup_upload_path(path)
-        except Exception: pass
-
-@app.get("/contacts/{contact_id}/files")
-def contact_files(contact_id: str):
-    contact = get_contact(contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Kişi bulunamadı.")
-
-    user_id = str(contact.get("user_id") or "")
-    folder_id = str(contact.get("google_folder_id") or "")
-
-    records = list_contact_files(contact_id) or []
-    merged = {}
-
-    # Önce veritabanı kayıtları.
-    for rec in records:
-        payload = _file_payload(rec, contact_id=contact_id, user_id=user_id)
-        if payload.get("id"):
-            merged[payload["id"]] = payload
-
-    # Sonra gerçek Drive klasörünü tarayarak küçük resim, boyut ve güncel linkleri tamamla.
-    if user_id:
-        try:
-            if not folder_id:
-                folder_id = get_or_create_contact_folder(user_id, contact.get("name", "Kişi"), contact_id)
-            drive_files = list_files_in_folder(user_id, folder_id) or []
-            for item in drive_files:
-                payload = _file_payload(item, contact_id=contact_id, user_id=user_id)
-                fid = payload.get("id")
-                if not fid:
-                    continue
-                old = merged.get(fid, {})
-                old.update({k: v for k, v in payload.items() if v not in (None, "")})
-                merged[fid] = old
-        except Exception as exc:
-            # Drive kopuksa en azından DB kayıtlarını döndür.
-            if not merged:
-                raise HTTPException(status_code=500, detail=f"Drive dosyaları alınamadı: {exc}")
-
-    files = list(merged.values())
-    files.sort(key=lambda x: str(x.get("modifiedTime") or x.get("createdTime") or ""), reverse=True)
-    return {"ok": True, "files": files}
-
-@app.post("/contacts/{contact_id}/files/upload")
-def upload_contact_file(contact_id: str, backup_password: str = Form(""), file: UploadFile = File(...)):
-    contact = get_contact(contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Kişi bulunamadı.")
-    user_id = contact.get("user_id")
-    path = _save_upload(file)
-    try:
-        folder_id = contact.get("google_folder_id") or get_or_create_contact_folder(user_id, contact.get("name", "Kişi"), contact_id)
-        uploaded = upload_file_to_folder(user_id, path, folder_id)
-        record = save_file_record(contact_id, uploaded.get("id", ""), _clean_display_file_name(file.filename or uploaded.get("name", "")), uploaded.get("mimeType", ""), uploaded.get("webViewLink", ""), uploaded.get("webContentLink", ""))
-        file_payload = _file_payload({**uploaded, **(record or {})}, contact_id=contact_id, user_id=user_id)
-        return {"ok": True, "file": file_payload, "drive_file": uploaded, **file_payload}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Dosya yüklenemedi: {exc}")
-    finally:
-        try: _cleanup_upload_path(path)
-        except Exception: pass
+    return folder["id"]
 
 
-@app.get("/files/{google_file_id}/view")
-def view_file(google_file_id: str):
-    from services.firebase_service import get_file_record_by_any_google_id, get_contact
-    record = get_file_record_by_any_google_id(google_file_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Dosya kaydı bulunamadı.")
-    contact = get_contact(record.get("contact_id"))
-    if not contact:
-        raise HTTPException(status_code=404, detail="Kişi bulunamadı.")
+def rename_drive_file(user_id: str, file_id: str, new_name: str):
+    file_id = str(file_id or "").strip()
+    new_name = safe_drive_name(new_name)
 
-    try:
-        result = download_drive_file_bytes(contact.get("user_id"), google_file_id)
-        media_type = result.get("mimeType") or "application/octet-stream"
-        filename = str(result.get("name") or record.get("name") or "dosya")
-        disposition = "inline" if media_type.startswith("image/") or media_type == "application/pdf" else "attachment"
-        return Response(
-            content=result.get("content", b""),
-            media_type=media_type,
-            headers={"Content-Disposition": f'{disposition}; filename="{filename}"'}
-        )
-    except Exception:
-        view_url = record.get("webViewLink") or record.get("view_url") or f"https://drive.google.com/file/d/{google_file_id}/view"
-        return RedirectResponse(view_url)
-
-
-@app.get("/contacts/{contact_id}/profile-image/view")
-def view_contact_profile_image(contact_id: str):
-    contact = get_contact(contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Kişi bulunamadı.")
-    file_id = str(contact.get("profile_image_file_id") or "").strip()
     if not file_id:
-        raise HTTPException(status_code=404, detail="Profil resmi bulunamadı.")
-    try:
-        result = download_drive_file_bytes(contact.get("user_id"), file_id)
-        return Response(content=result.get("content", b""), media_type=result.get("mimeType") or "image/jpeg")
-    except Exception:
-        return RedirectResponse(f"https://drive.google.com/thumbnail?id={file_id}&sz=w600")
+        return None
 
-@app.put("/files/{google_file_id}/replace")
-def replace_file(google_file_id: str, file: UploadFile = File(...)):
-    path = _save_upload(file)
+    service = init_drive(user_id)
+
+    return service.files().update(
+        fileId=file_id,
+        body={"name": new_name},
+        fields="id, name, mimeType, webViewLink, webContentLink"
+    ).execute()
+
+
+def get_or_create_root_folder(user_id: str):
+    folder_id = find_folder_by_name(user_id, ROOT_FOLDER_NAME)
+
+    if folder_id:
+        return folder_id
+
+    return create_folder(user_id, ROOT_FOLDER_NAME)
+
+
+def get_or_create_contact_folder(user_id: str, contact_name: str, contact_id: str):
+    root_folder_id = get_or_create_root_folder(user_id)
+
+    folder_name = f"{safe_drive_name(contact_name)}_{contact_id}"
+
+    folder_id = find_folder_by_name(user_id, folder_name, root_folder_id)
+
+    if folder_id:
+        return folder_id
+
+    return create_folder(user_id, folder_name, root_folder_id)
+
+
+def list_files_in_folder(user_id: str, folder_id: str):
+    service = init_drive(user_id)
+
+    query = f"'{folder_id}' in parents and trashed=false"
+
+    result = service.files().list(
+        q=query,
+        fields="files(id, name, mimeType, size, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime)",
+        orderBy="modifiedTime desc"
+    ).execute()
+
+    files = result.get("files", [])
+
+    for item in files:
+        if item.get("id"):
+            # Hız için listeleme sırasında her dosyaya tekrar public izin basmıyoruz.
+            # Yükleme sırasında public izin zaten veriliyor; burada sadece linkleri zenginleştiriyoruz.
+            enrich_file(item)
+
+    return files
+
+
+def upload_file_to_folder(user_id: str, file_path: str, folder_id: str):
+    service = init_drive(user_id)
+
+    file_name = os.path.basename(file_path)
+
+    mime_type, _ = mimetypes.guess_type(file_path)
+
+    if mime_type is None:
+        mime_type = "application/octet-stream"
+
+    metadata = {
+        "name": file_name,
+        "parents": [folder_id]
+    }
+
+    media = MediaFileUpload(
+        file_path,
+        mimetype=mime_type,
+        resumable=False
+    )
+
+    uploaded_file = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime, size"
+    ).execute()
+
+    make_file_public(user_id, uploaded_file["id"])
+
+    uploaded_file = service.files().get(
+        fileId=uploaded_file["id"],
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime, size"
+    ).execute()
+
+    return enrich_file(uploaded_file)
+
+
+def delete_drive_file(user_id: str, file_id: str):
+    service = init_drive(user_id)
+
+    service.files().delete(
+        fileId=file_id
+    ).execute()
+
+
+def replace_file_content(user_id: str, file_id: str, file_path: str):
+    service = init_drive(user_id)
+
+    mime_type, _ = mimetypes.guess_type(file_path)
+
+    if mime_type is None:
+        mime_type = "application/octet-stream"
+
+    media = MediaFileUpload(
+        file_path,
+        mimetype=mime_type,
+        resumable=False
+    )
+
+    updated_file = service.files().update(
+        fileId=file_id,
+        media_body=media,
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime, size"
+    ).execute()
+
+    make_file_public(user_id, file_id)
+
+    updated_file = service.files().get(
+        fileId=file_id,
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime, size"
+    ).execute()
+
+    return enrich_file(updated_file)
+
+
+
+def download_drive_file_bytes(user_id: str, file_id: str):
+    file_id = str(file_id or "").strip()
+
+    if not file_id:
+        raise ValueError("Dosya id bos olamaz.")
+
+    service = init_drive(user_id)
+
+    metadata = service.files().get(
+        fileId=file_id,
+        fields="id, name, mimeType"
+    ).execute()
+
+    request = service.files().get_media(fileId=file_id)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+
+    done = False
+
+    while not done:
+        _, done = downloader.next_chunk()
+
+    buffer.seek(0)
+
+    return {
+        "id": metadata.get("id", file_id),
+        "name": metadata.get("name", ""),
+        "mimeType": metadata.get("mimeType", "application/octet-stream"),
+        "content": buffer.getvalue()
+    }
+
+
+# ============================================================
+# CONNECTDESK BACKUP DRIVE HELPERS
+# ============================================================
+
+def get_or_create_contact_backup_folder(user_id: str, contact_name: str, contact_id: str):
+    contact_folder_id = get_or_create_contact_folder(user_id, contact_name, contact_id)
+
+    backup_folder_name = "__BACKUP__"
+
+    folder_id = find_folder_by_name(user_id, backup_folder_name, contact_folder_id)
+
+    if folder_id:
+        return folder_id
+
+    return create_folder(user_id, backup_folder_name, contact_folder_id)
+
+
+def upload_file_to_folder_as(user_id: str, file_path: str, folder_id: str, drive_file_name: str):
+    service = init_drive(user_id)
+
+    mime_type, _ = mimetypes.guess_type(file_path)
+
+    if mime_type is None:
+        mime_type = "application/octet-stream"
+
+    metadata = {
+        "name": str(drive_file_name or os.path.basename(file_path)).strip(),
+        "parents": [folder_id]
+    }
+
+    media = MediaFileUpload(
+        file_path,
+        mimetype=mime_type,
+        resumable=False
+    )
+
+    uploaded_file = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime, size"
+    ).execute()
+
+    make_file_public(user_id, uploaded_file["id"])
+
+    uploaded_file = service.files().get(
+        fileId=uploaded_file["id"],
+        fields="id, name, mimeType, webViewLink, webContentLink, thumbnailLink, createdTime, modifiedTime, size"
+    ).execute()
+
+    return enrich_file(uploaded_file)
+
+
+def upload_file_with_backup(user_id: str, file_path: str, original_folder_id: str, backup_folder_id: str, original_filename: str = ""):
+    original_name = str(original_filename or os.path.basename(file_path)).strip() or os.path.basename(file_path)
+
+    original_file = upload_file_to_folder_as(
+        user_id=user_id,
+        file_path=file_path,
+        folder_id=original_folder_id,
+        drive_file_name=original_name
+    )
+
+    backup_file = upload_file_to_folder_as(
+        user_id=user_id,
+        file_path=file_path,
+        folder_id=backup_folder_id,
+        drive_file_name=f"BACKUP_{original_name}"
+    )
+
+    return {
+        "original": original_file,
+        "backup": backup_file
+    }
+
+
+def upload_text_backup_file(user_id: str, folder_id: str, file_name: str, text_content: str):
+    import tempfile
+
+    safe_name = str(file_name or "recovery_backup.json").strip()
+
+    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".json") as f:
+        f.write(str(text_content or ""))
+        temp_path = f.name
+
     try:
-        # user_id bilinmediğinde Drive service token bulamayabilir; mevcut EXE akışında google_file_id üzerinden record bulunur.
-        from services.firebase_service import get_file_record_by_any_google_id, get_contact
-        record = get_file_record_by_any_google_id(google_file_id)
-        if not record:
-            raise HTTPException(status_code=404, detail="Dosya kaydı bulunamadı.")
-        contact = get_contact(record.get("contact_id"))
-        result = replace_file_content(contact.get("user_id"), google_file_id, path)
-        return {"ok": True, "file": _file_payload(result, contact_id=record.get("contact_id"), user_id=contact.get("user_id"))}
+        return upload_file_to_folder_as(
+            user_id=user_id,
+            file_path=temp_path,
+            folder_id=folder_id,
+            drive_file_name=safe_name
+        )
     finally:
-        try: _cleanup_upload_path(path)
-        except Exception: pass
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
 
-@app.delete("/files/{google_file_id}")
-def delete_file(google_file_id: str):
-    from services.firebase_service import get_file_record_by_any_google_id, get_contact
-    record = get_file_record_by_any_google_id(google_file_id)
-    if record:
-        contact = get_contact(record.get("contact_id"))
-        if contact:
-            try: delete_drive_file(contact.get("user_id"), google_file_id)
-            except Exception: pass
-    delete_file_record_by_google_id(google_file_id)
-    return {"ok": True}
 
-@app.get("/users/{user_id}/drive/status")
-def drive_status(user_id: str):
-    return {"ok": True, **get_user_drive_status(user_id)}
+def get_or_create_user_recovery_folder(user_id: str):
+    root_folder_id = get_or_create_root_folder(user_id)
 
-@app.get("/users/{user_id}/drive/auth-url")
-def drive_auth(user_id: str):
-    return {"ok": True, "auth_url": create_google_auth_url(user_id)}
+    folder_name = "__RECOVERY__"
 
-@app.get("/google/callback")
-def google_callback(request: Request, state: str = ""):
-    try:
-        result = finish_google_callback(str(request.url), state)
-        ok = True
-        title = "Google Drive bağlantısı tamamlandı"
-        message = "ConnectDesk hesabınız Google Drive ile bağlandı. Bu sekmeyi kapatıp ana uygulamaya dönebilirsiniz."
-        detail = result
-    except Exception as exc:
-        ok = False
-        title = "Google Drive bağlantısı tamamlanamadı"
-        message = "Bağlantı sırasında hata oluştu. Ana uygulamaya dönüp tekrar deneyin."
-        detail = {"error": str(exc)}
+    folder_id = find_folder_by_name(user_id, folder_name, root_folder_id)
 
-    status_text = "Başarılı" if ok else "Hata"
-    accent = "#d4952f" if ok else "#ef4444"
-    return HTMLResponse(f"""
-    <!doctype html>
-    <html lang="tr">
-    <head>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>ConnectDesk Drive Bağlantısı</title>
-      <style>
-        * {{ box-sizing: border-box; }}
-        body {{
-          margin: 0;
-          min-height: 100vh;
-          display: grid;
-          place-items: center;
-          background: radial-gradient(circle at top left, #142033 0, #05080d 42%, #02040a 100%);
-          color: #f8fafc;
-          font-family: Arial, sans-serif;
-          padding: 24px;
-        }}
-        .card {{
-          width: min(720px, 100%);
-          border: 1px solid rgba(255,255,255,.14);
-          background: #111821;
-          border-radius: 22px;
-          padding: 34px;
-          box-shadow: 0 30px 90px rgba(0,0,0,.45);
-        }}
-        .brand {{ display:flex; align-items:center; gap:16px; margin-bottom:24px; }}
-        .mark {{ width:58px; height:58px; border-radius:14px; display:grid; place-items:center; background:#182538; color:#ffd88a; font-size:34px; font-weight:900; border:1px solid rgba(212,149,47,.45); }}
-        h1 {{ margin:0; font-size:34px; }}
-        p {{ color:#cbd5e1; line-height:1.55; font-size:17px; }}
-        .status {{ display:inline-block; margin:12px 0 18px; padding:8px 12px; border-radius:999px; background:{accent}; color:#090909; font-weight:900; }}
-        .buttons {{ display:flex; gap:12px; flex-wrap:wrap; margin-top:22px; }}
-        button, a {{ border:0; border-radius:12px; padding:14px 18px; font-weight:900; cursor:pointer; text-decoration:none; }}
-        button {{ background:{accent}; color:#090909; }}
-        a {{ background:#263445; color:#f8fafc; }}
-        pre {{ white-space:pre-wrap; word-break:break-word; max-height:170px; overflow:auto; background:#070c13; color:#94a3b8; padding:14px; border-radius:12px; border:1px solid rgba(255,255,255,.08); }}
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <div class="brand"><div class="mark">C</div><div><h1>ConnectDesk</h1><p>Google Drive bağlantısı</p></div></div>
-        <span class="status">{status_text}</span>
-        <h1>{title}</h1>
-        <p>{message}</p>
-        <div class="buttons">
-          <button onclick="window.close()">Sekmeyi Kapat</button>
-          <a href="https://turkishotguns.com/index.html" target="_self">Uygulamaya Dön</a>
-        </div>
-        <pre>{detail}</pre>
-      </div>
-      <script>
-        try {{ if (window.opener) {{ window.opener.postMessage({{type:'CONNECTDESK_DRIVE_CONNECTED'}}, '*'); }} }} catch(e) {{}}
-      </script>
-    </body>
-    </html>
-    """)
+    if folder_id:
+        return folder_id
 
-@app.post("/forgot-password/request-code")
-def forgot_request_form(email: str = Form(...)):
-    email = _email(email)
-    if not get_user(email):
-        raise HTTPException(status_code=404, detail="Bu e-posta ile kayıtlı kullanıcı yok.")
-    code = generate_reset_code()
-    save_password_reset_code(email, code, int(time.time()) + RESET_TTL_SECONDS)
-    sent = send_password_reset_code(email, code)
-    if not sent:
-        raise HTTPException(status_code=500, detail="SMTP ayarları eksik veya mail gönderilemedi.")
-    return {"ok": True, "message": "Doğrulama kodu gönderildi."}
-
-@app.post("/forgot-password/send-code")
-def forgot_send_json(payload: ForgotJSON):
-    return forgot_request_form(str(payload.email))
-
-@app.post("/forgot-password/verify-code")
-def forgot_verify_form(email: str = Form(...), code: str = Form(...)):
-    ok = verify_password_reset_code(_email(email), str(code).strip(), int(time.time()))
-    if not ok:
-        raise HTTPException(status_code=400, detail="Doğrulama kodu hatalı veya süresi dolmuş.")
-    return {"ok": True, "message": "Kod doğrulandı."}
-
-@app.post("/forgot-password/verify-code-json")
-def forgot_verify_json(payload: VerifyCodeJSON):
-    return forgot_verify_form(str(payload.email), payload.code)
-
-@app.post("/forgot-password/reset")
-async def forgot_reset(request: Request):
-    ctype = request.headers.get("content-type", "")
-    if "application/json" in ctype:
-        body = await request.json()
-        email = body.get("email", "")
-        code = body.get("code", "")
-        new_password = body.get("new_password", "")
-    else:
-        form = await request.form()
-        email = form.get("email", "")
-        code = form.get("code", "")
-        new_password = form.get("new_password", "")
-    email = _email(email)
-    if len(str(new_password)) < 4:
-        raise HTTPException(status_code=400, detail="Şifre en az 4 karakter olmalıdır.")
-    if not verify_password_reset_code(email, str(code).strip(), int(time.time())):
-        raise HTTPException(status_code=400, detail="Doğrulama kodu hatalı veya süresi dolmuş.")
-    if not update_user_password_by_email(email, str(new_password)):
-        raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı.")
-    mark_password_reset_code_used(email)
-    return {"ok": True, "message": "Şifre güncellendi."}
-
-@app.get("/recovery", response_class=HTMLResponse)
-def recovery_page():
-    return """
-    <!doctype html><html lang='tr'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>ConnectDesk Kurtarma</title>
-    <style>body{margin:0;background:#07111f;color:#f8fafc;font-family:Arial;padding:40px}.card{max-width:900px;margin:auto;background:#0d1b2e;border:1px solid #1e4775;border-radius:18px;padding:28px}input{width:100%;padding:14px;margin:8px 0 16px;background:#06101d;color:#fff;border:1px solid #31527a;border-radius:10px}button{padding:14px 22px;border:0;border-radius:10px;background:#2f7ee6;color:#fff;font-weight:800}.msg{margin-top:16px;white-space:pre-wrap}</style></head><body><div class='card'><h1>ConnectDesk Kurtarma</h1><p>Yedekleme şifresiyle son kurtarma yedeğini çözmek için kullanılır.</p><label>Kullanıcı e-posta adresi</label><input id='email' placeholder='ornek@mail.com'><label>Yedekleme şifresi</label><input id='password' type='password' placeholder='Yedekleme şifren'><button onclick='openBackup()'>Yedeği Aç</button><div id='msg' class='msg'></div></div><script>async function openBackup(){let msg=document.getElementById('msg');msg.textContent='Kontrol ediliyor...';try{let r=await fetch('/recovery/open',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email.value,backup_password:password.value})});let d=await r.json();if(!r.ok)throw new Error(d.detail||'İşlem başarısız');msg.textContent=JSON.stringify(d.data,null,2)}catch(e){msg.textContent=e.message}}</script></body></html>
-    """
-
-class RecoveryOpen(BaseModel):
-    email: EmailStr
-    backup_password: str
-
-@app.post("/recovery/open")
-def recovery_open(payload: RecoveryOpen):
-    user = get_user(str(payload.email).lower())
-    if not user:
-        raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı.")
-    latest = get_latest_recovery_file(user["id"])
-    if not latest:
-        raise HTTPException(status_code=404, detail="Kurtarma yedeği bulunamadı.")
-    text = download_recovery_file_text(latest["id"])
-    data = decrypt_recovery_backup_text(text, payload.backup_password)
-    return {"ok": True, "file": latest, "data": data}
-
-@app.get("/users/{user_id}/backup/status")
-def backup_status(user_id: str):
-    return {"ok": True, **get_user_backup_settings(user_id)}
-
-@app.post("/users/{user_id}/backup/enable")
-def backup_enable(user_id: str, backup_password: str = Form(...)):
-    if len(backup_password) < 4:
-        raise HTTPException(status_code=400, detail="Yedek şifresi en az 4 karakter olmalı.")
-    user = set_backup_enabled(user_id, True, hash_backup_password(backup_password))
-    if not user:
-        raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı.")
-    return {"ok": True, "backup_enabled": True}
-
-@app.post("/users/{user_id}/backup/disable")
-def backup_disable(user_id: str):
-    user = set_backup_enabled(user_id, False)
-    if not user:
-        raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı.")
-    return {"ok": True, "backup_enabled": False}
-
-@app.post("/users/{user_id}/backup/recovery/create")
-def backup_create(user_id: str, backup_password: str = Form(...)):
-    user = get_user(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı.")
-    contacts = list_contacts(user_id)
-    files = list_user_file_records(user_id)
-    uploaded = upload_encrypted_recovery_backup(user, contacts, files, backup_password)
-    save_recovery_backup_record(user_id, uploaded.get("id", ""), uploaded.get("name", ""))
-    return {"ok": True, "backup": uploaded}
-
-@app.post("/users/{user_id}/backup/change-password")
-def backup_change_password(user_id: str, old_backup_password: str = Form(...), new_backup_password: str = Form(...), new_backup_password_repeat: str = Form(...)):
-    if new_backup_password != new_backup_password_repeat:
-        raise HTTPException(status_code=400, detail="Yeni yedek şifreleri eşleşmiyor.")
-    settings = get_user_backup_settings(user_id)
-    if settings.get("backup_password_hash") and not verify_backup_password(old_backup_password, settings["backup_password_hash"]):
-        raise HTTPException(status_code=400, detail="Eski yedek şifresi hatalı.")
-    set_backup_enabled(user_id, True, hash_backup_password(new_backup_password))
-    return {"ok": True, "message": "Yedek şifresi güncellendi."}
+    return create_folder(user_id, folder_name, root_folder_id)
